@@ -1,0 +1,228 @@
+--1--
+SELECT  p.id,
+        p.name,
+        a.sum,
+        count(r.result) AS results
+FROM people AS p
+JOIN accounts AS a
+    ON p.id = a.peopleid
+JOIN results AS r
+    ON a.peopleid= r.peopleid
+GROUP BY p.id,
+         p.name,
+         a.sum;
+
+--2--
+CREATE OR REPLACE VIEW high_jump_top_3 AS
+    SELECT p.id,
+           p.name,
+           r.result
+    FROM people AS p
+    JOIN results AS r
+        ON p.id = r.peopleid
+    JOIN sports AS s
+        ON r.sportid = s.id
+    WHERE p.id = r.peopleid
+        and s.name = 'High Jump'
+        and r.result is not null
+ORDER BY r.result desc
+limit 3;
+
+SELECT *
+FROM high_jump_top_3;
+
+--3--
+CREATE OR REPLACE VIEW top_10 AS
+    SELECT  p.id,
+            p.name,
+            count(r.result) AS total
+    FROM people AS p
+    JOIN results AS r ON p.id = r.peopleid
+    GROUP BY p.id,
+             p.name
+    ORDER BY total desc
+    limit 10;
+
+SELECT *
+FROM top_10;
+
+--4--
+CREATE OR REPLACE FUNCTION InsertAthlete(_name varchar, _gender varchar, _height float)
+RETURNS void AS
+    $BODY$
+    DECLARE newId integer;
+        BEGIN
+            SELECT max(id)+1
+                into newId
+            FROM people;
+            if _height <= 0 then
+                RAISE EXCEPTION 'Invalid Height';
+            else
+                INSERT INTO people(id, name, gender, height) VALUES
+                    (newId, _name, _gender, _height);
+            end if;
+        END $BODY$
+    LANGUAGE 'plpgsql';
+
+--5--
+CREATE OR REPLACE FUNCTION CreateAccountFunction()
+    RETURNS trigger AS
+    $BODY$
+    BEGIN
+        INSERT INTO accounts(peopleid, sum, last_updated) VALUES
+            (NEW.id, 0, Now()::date);
+        RETURN NEW;
+    end;
+    $BODY$
+    LANGUAGE 'plpgsql';
+
+CREATE TRIGGER CreateAccountForAthlete
+    AFTER INSERT ON people
+    FOR EACH ROW EXECUTE PROCEDURE CreateAccountFunction();
+
+--6--
+CREATE OR REPLACE FUNCTION AddResults(_pid integer, _cid integer, _sid integer, _result float)
+    RETURNS VOID AS
+    $BODY$
+    DECLARE tempResult float;
+        BEGIN
+            if (EXISTS( SELECT 1
+                        FROM people AS p
+                        WHERE p.id = _pid))
+                   and (EXISTS (SELECT 1
+                                FROM competitions AS c
+                                WHERE c.id = _cid))
+                   and (EXISTS( SELECT 1
+                                FROM sports AS s
+                                WHERE s.id = _sid))
+                   and _result >= 0
+            then if EXISTS( SELECT 1
+                            FROM results AS r
+                            WHERE competitionid = _cid
+                              and peopleid = _pid
+                              and sportid = _sid)
+                    then SELECT result
+                            INTO tempResult
+                        FROM results AS r
+                        WHERE peopleid = _pid
+                        and competitionid = _cid
+                        and sportid = _sid;
+                        if tempResult >= _result
+                            then RAISE EXCEPTION 'Better result exists';
+                        else UPDATE results
+                                SET result = _result
+                              WHERE peopleid = _pid
+                                and competitionid = _cid
+                                and sportid = _sid;
+                        end if;
+                    else INSERT INTO results(peopleid, competitionid, sportid, result)
+                            VALUES(_pid,_cid,_sid,_result);
+                    end if;
+            else RAISE EXCEPTION 'Invalid input';
+            end if;
+        end;
+    $BODY$
+    LANGUAGE 'plpgsql';
+
+--7--
+CREATE OR REPLACE FUNCTION resultRecordCheckFunc()
+    RETURNS trigger AS
+    $BODY$
+    BEGIN
+        if (NEW.result > (  SELECT s.record
+                              FROM sports AS s
+                             WHERE NEW.sportid = s.id))
+            then UPDATE sports
+                    SET record = NEW.result
+                  WHERE id = NEW.sportid;
+            UPDATE accounts
+               SET sum = Cast(sum AS int) + 5000
+             WHERE peopleid = NEW.peopleid;
+        end if;
+        if (NOT EXISTS(SELECT result
+                         FROM results r
+                        WHERE r.peopleid = NEW.peopleid
+                          and r.sportid = NEW.sportid))
+            then UPDATE accounts
+                    SET sum = Cast(sum AS int) + 1000
+                  WHERE peopleid = NEW.peopleid;
+        else UPDATE accounts
+                SET sum = Cast(sum AS int) + 500
+              WHERE peopleid = NEW.peopleid;
+        end if;
+        RETURN NEW;
+    end;
+    $BODY$
+    LANGUAGE 'plpgsql';
+
+CREATE TRIGGER resultRecordCheck
+    AFTER INSERT OR UPDATE ON results
+    FOR EACH ROW EXECUTE PROCEDURE resultRecordCheckFunc();
+
+--8--
+CREATE OR REPLACE FUNCTION DeleteAthlete(_peopleID integer)
+RETURNS VOID AS
+    $BODY$
+    BEGIN
+        DELETE FROM results
+        WHERE peopleid = _peopleID;
+        DELETE FROM accounts
+        WHERE peopleid = _peopleID;
+        DELETE FROM people
+        WHERE id = _peopleID;
+    end;
+    $BODY$
+    LANGUAGE 'plpgsql';
+
+SELECT deleteathlete(179);
+
+--9--
+CREATE OR REPLACE FUNCTION SplitMoneyFunc()
+RETURNS trigger AS
+    $BODY$
+    DECLARE cash integer;
+    DECLARE cashSplit integer;
+    DECLARE row RECORD;
+    BEGIN
+        SELECT sum
+            INTO cash
+        FROM accounts
+        WHERE peopleid = OLD.peopleid;
+        SELECT FLOOR(cash::INT / count(peopleid)::INT - 1)
+            INTO cashSplit
+        FROM accounts;
+        FOR row in (SELECT * FROM accounts) LOOP
+            UPDATE accounts
+            SET sum = sum::int + cashSplit
+            WHERE accounts.peopleid = row.peopleid;
+            UPDATE accounts
+            SET last_updated = now()::date
+            WHERE accounts.peopleid = row.peopleid;
+        end loop;
+        RETURN NEW;
+    end;
+    $BODY$
+    LANGUAGE 'plpgsql';
+
+CREATE TRIGGER SplitMoney
+    BEFORE DELETE ON accounts
+    FOR EACH ROW EXECUTE PROCEDURE SplitMoneyFunc();
+
+--10--
+CREATE OR REPLACE FUNCTION LastCompetition(_sport varchar)
+RETURNS varchar AS
+    $BODY$
+    DECLARE _date varchar;
+    BEGIN
+        SELECT max(c.held)
+        INTO _date
+        FROM competitions AS c
+        JOIN results r
+            on c.id = r.competitionid
+        JOIN sports s
+            on r.sportid = s.id
+        WHERE s.name = _sport;
+        RETURN _date;
+    end;
+    $BODY$
+    LANGUAGE 'plpgsql';
